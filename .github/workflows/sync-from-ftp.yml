@@ -90,10 +90,65 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config http.postBuffer 524288000
+          git config http.version HTTP/1.1
+
+          find . -mindepth 2 -name .git -type d -print -exec rm -rf {} +
+
+          while IFS= read -r big; do
+            [ -n "$big" ] || continue
+            echo "::warning title=skipped large file::$big"
+            rm -f "$big"
+          done < <(find . -type f -size +95M -print)
+
           git add -A
           if git diff --cached --quiet; then
-            echo "No site files downloaded from FTP."
+            echo "::error::No site files were left to commit after download."
             exit 1
           fi
+          echo "Files to commit: $(git diff --cached --name-only | wc -l)"
           git commit -m "Sync site files from FTP server."
-          git push
+
+          attempt=1
+          while [ "$attempt" -le 8 ]; do
+            set +e
+            git push origin HEAD:main > /tmp/push.out 2>&1
+            code=$?
+            set -e
+            cat /tmp/push.out
+            if [ "$code" -eq 0 ]; then
+              exit 0
+            fi
+
+            paths=$(
+              {
+                sed -n 's/.*[Ff]ile \(.*\) is [0-9.][0-9.]* MB.*/\1/p' /tmp/push.out
+                sed -n 's/^remote:[[:space:]]*path:[[:space:]]*//p' /tmp/push.out | sed 's/:.*//'
+                grep -oE 'path: [^ :]+' /tmp/push.out | sed 's/^path: //'
+              } | sed '/^$/d' | sort -u
+            )
+            if [ -z "$paths" ]; then
+              grep -E 'remote:|error:|fatal:|rejected|GH00' /tmp/push.out | head -n 40 | while IFS= read -r line; do
+                echo "::error title=git push::$line"
+              done
+              exit "$code"
+            fi
+
+            echo "Removing blocked paths and retrying push ($attempt):"
+            echo "$paths"
+            while IFS= read -r path; do
+              [ -n "$path" ] || continue
+              echo "::warning title=skipped blocked file::$path"
+              git rm -r --cached --ignore-unmatch -- "$path" || true
+              rm -rf -- "$path"
+            done <<< "$paths"
+            git add -A
+            if git diff --cached --quiet; then
+              echo "::error::Nothing left to push after removing blocked files."
+              exit 1
+            fi
+            git commit -m "Skip files GitHub refused during FTP sync."
+            attempt=$((attempt + 1))
+          done
+          echo "::error::git push still failed after removing blocked files."
+          exit 1
